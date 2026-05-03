@@ -126,6 +126,7 @@ class MainWindow(QMainWindow):
         self._collector = DataCollector()
         self._collector.set_backend(self._backend)
         self._unlimited_mode = False
+        self._frame_rate = FRAME_RATE_DEFAULT
         self._probe_list: list[dict] = []
         self._pack_path: Optional[Path] = None
         self._config_path = Path("loopmaster.json")
@@ -158,9 +159,9 @@ class MainWindow(QMainWindow):
                 self._load_variables()
                 # 恢复设置
                 if "sample_rate" in cfg:
-                    self._rate_spin.setValue(cfg["sample_rate"])
+                    self._set_rate_combo(cfg["sample_rate"])
                 if "frame_rate" in cfg:
-                    self._frame_rate_spin.setValue(cfg["frame_rate"])
+                    self._set_frame_rate(cfg["frame_rate"])
                 if "swd_freq_index" in cfg:
                     idx = cfg["swd_freq_index"]
                     if 0 <= idx < self._swd_freq_combo.count():
@@ -210,6 +211,19 @@ class MainWindow(QMainWindow):
         act_disconnect = QAction("断开", self)
         act_disconnect.triggered.connect(self._on_disconnect_ui)
         probe_menu.addAction(act_disconnect)
+
+        # 显示菜单 — 帧率选择
+        display_menu = mb.addMenu("显示(&D)")
+        self._fps_actions = []
+        self._fps_group = QAction(self)  # dummy action group holder
+        for fps in PRESET_FRAME_RATES:
+            act = QAction(f"{fps} FPS", self)
+            act.setCheckable(True)
+            act.setChecked(fps == FRAME_RATE_DEFAULT)
+            act.setData(fps)
+            act.triggered.connect(lambda checked, f=fps: self._set_frame_rate(f))
+            display_menu.addAction(act)
+            self._fps_actions.append(act)
 
     # ================================================================
     #  Status Bar
@@ -504,58 +518,22 @@ class MainWindow(QMainWindow):
         rate_group = QHBoxLayout()
         rate_group.setSpacing(6)
         rate_group.addWidget(QLabel("采样率:"))
-        self._rate_spin = QSpinBox()
-        self._rate_spin.setRange(1, 10000)
-        self._rate_spin.setValue(100)
-        self._rate_spin.setSuffix(" Hz")
-        self._rate_spin.setFixedWidth(100)
-        self._rate_spin.valueChanged.connect(self._on_rate_changed)
-        rate_group.addWidget(self._rate_spin)
+        self._rate_combo = QComboBox()
+        self._rate_combo.setFixedWidth(100)
+        self._rate_combo.addItem("1 Hz", 1)
+        self._rate_combo.addItem("10 Hz", 10)
+        self._rate_combo.addItem("50 Hz", 50)
+        self._rate_combo.addItem("100 Hz", 100)
+        self._rate_combo.addItem("200 Hz", 200)
+        self._rate_combo.addItem("500 Hz", 500)
+        self._rate_combo.addItem("1000 Hz", 1000)
+        self._rate_combo.addItem("MAX", 0)
+        self._rate_combo.setCurrentIndex(3)  # default 100 Hz
+        self._rate_combo.currentIndexChanged.connect(self._on_rate_combo_changed)
+        rate_group.addWidget(self._rate_combo)
         ctrl_layout.addLayout(rate_group)
 
-        btn_max = QPushButton("MAX")
-        btn_max.setObjectName("maxBtn")
-        btn_max.setFixedWidth(44)
-        btn_max.setToolTip("无限制模式 — 以硬件极限速度采样")
-        btn_max.clicked.connect(lambda: self._rate_spin.setValue(1000))
-        ctrl_layout.addWidget(btn_max)
-
         ctrl_layout.addSpacing(16)
-
-        # 分隔
-        sep_fps = QFrame()
-        sep_fps.setFrameShape(QFrame.VLine)
-        sep_fps.setStyleSheet("color: #3a3a5a;")
-        sep_fps.setFixedWidth(1)
-        ctrl_layout.addWidget(sep_fps)
-        ctrl_layout.addSpacing(4)
-
-        # 帧率控制
-        ctrl_layout.addWidget(QLabel("显示帧率:"))
-        self._frame_rate_spin = QSpinBox()
-        self._frame_rate_spin.setRange(1, 120)
-        self._frame_rate_spin.setSuffix(" FPS")
-        self._frame_rate_spin.setFixedWidth(85)
-        self._frame_rate_spin.valueChanged.connect(self._on_frame_rate_changed)
-        self._frame_rate_spin.setValue(FRAME_RATE_DEFAULT)  # connect 之后设置，确保信号触发
-        ctrl_layout.addWidget(self._frame_rate_spin)
-
-        for fps in PRESET_FRAME_RATES:
-            btn = QPushButton(str(fps))
-            btn.setObjectName("presetBtn")
-            btn.setFixedWidth(36)
-            btn.clicked.connect(lambda checked, r=fps: self._frame_rate_spin.setValue(r))
-            ctrl_layout.addWidget(btn)
-
-        ctrl_layout.addSpacing(8)
-
-        # 分隔
-        sep_tw = QFrame()
-        sep_tw.setFrameShape(QFrame.VLine)
-        sep_tw.setStyleSheet("color: #3a3a5a;")
-        sep_tw.setFixedWidth(1)
-        ctrl_layout.addWidget(sep_tw)
-        ctrl_layout.addSpacing(4)
 
         # 时间窗口
         ctrl_layout.addWidget(QLabel("时间窗口:"))
@@ -962,7 +940,9 @@ class MainWindow(QMainWindow):
                 "未选择变量，请先在变量选择标签页中选择。")
             return
 
-        rate = self._rate_spin.value()
+        rate = self._rate_combo.currentData()
+        if rate == 0:
+            rate = 1000  # MAX → unlimited mode
 
         self._collector.configure(rate, BUFFER_SECONDS)
         self._collector.set_variables(self._monitor_list)
@@ -1034,14 +1014,20 @@ class MainWindow(QMainWindow):
         # Reset plot auto-range
         self._plot.enableAutoRange(x=True)
 
-    def _on_rate_changed(self, rate: int):
-        """采样率变更时同步到采集器和定时器。无限制模式下可切回定时模式。"""
+    def _on_rate_combo_changed(self, index: int):
+        """采样率下拉框变更。"""
+        rate = self._rate_combo.currentData()
+        if rate == 0:
+            rate = 1000  # MAX → unlimited
+        self._apply_rate(rate)
+
+    def _apply_rate(self, rate: int):
+        """采样率变更时同步到采集器和定时器。"""
         self._collector._sample_rate = rate
         if not self._collector.is_running:
             return
         if self._unlimited_mode:
             if rate < 500:
-                # 从无限制模式切回定时器模式
                 self._unlimited_mode = False
                 interval_ms = max(1, int(1000 / rate))
                 self._sample_timer.setInterval(interval_ms)
@@ -1056,6 +1042,14 @@ class MainWindow(QMainWindow):
             else:
                 interval_ms = max(1, int(1000 / rate))
                 self._sample_timer.setInterval(interval_ms)
+
+    def _set_rate_combo(self, rate: int):
+        """Set combo to match a saved rate value."""
+        if rate >= 500:
+            rate = 0  # MAX
+        idx = self._rate_combo.findData(rate)
+        if idx >= 0:
+            self._rate_combo.setCurrentIndex(idx)
 
     def _setup_fast_path(self):
         """预计算采样热路径的全部引用，消除函数调用和字典查找。"""
@@ -1213,11 +1207,12 @@ class MainWindow(QMainWindow):
                 pipe_depth = 8
 
             try:
+                batch_start = time.perf_counter()
                 all_sample_vals = BACKEND.read_block_pipelined(
                     block_start, block_words, block_plans, pipe_depth)
-                now = time.perf_counter()
-                for sample_vals in all_sample_vals:
-                    ts_deque.append(now - t0)
+                sample_dt = 1.0 / max(c._sample_rate, 1)
+                for i, sample_vals in enumerate(all_sample_vals):
+                    ts_deque.append(batch_start - t0 + i * sample_dt)
                     c._sample_count += 1
                     for (_, _, _, _, _, _, buf), val in zip(block_plans, sample_vals):
                         buf.append(val)
@@ -1312,7 +1307,7 @@ class MainWindow(QMainWindow):
 
         actual = self._collector.actual_rate
         configured = self._collector._sample_rate
-        fps = self._frame_rate_spin.value() if self._frame_rate_spin else 60
+        fps = self._frame_rate
         scroll_mark = "" if self._auto_scroll else " (已暂停)"
         tw = self._time_window_spin.value() if self._time_window_spin else TIME_WINDOW_DEFAULT
         if self._unlimited_mode:
@@ -1349,16 +1344,19 @@ class MainWindow(QMainWindow):
             self._plot.enableAutoRange(y=False)
             self._y_auto_btn.setText("Y手动")
 
-    def _on_frame_rate_changed(self, fps: int):
-        """FPS 变更时更新定时器间隔。"""
+    def _set_frame_rate(self, fps: int):
+        """FPS 变更时更新定时器间隔和菜单选中状态。"""
+        self._frame_rate = fps
         interval = max(8, int(1000 / fps))
         self._plot_timer.setInterval(interval)
         if not self._plot_timer.isActive():
             self._plot_timer.start()
+        for act in self._fps_actions:
+            act.setChecked(act.data() == fps)
 
     def _process_display_data(self, data: dict) -> dict:
         sample_rate = self._collector.actual_rate
-        fps = self._frame_rate_spin.value() if self._frame_rate_spin else 60
+        fps = self._frame_rate
         if sample_rate <= 0 or fps <= 0:
             return data
 
@@ -1529,8 +1527,8 @@ class MainWindow(QMainWindow):
     def _save_config(self):
         cfg = {
             "elf_path": str(self._elf_path) if self._elf_path else "",
-            "sample_rate": self._rate_spin.value(),
-            "frame_rate": self._frame_rate_spin.value(),
+            "sample_rate": self._rate_combo.currentData() or 1000,
+            "frame_rate": self._frame_rate,
             "swd_freq_index": self._swd_freq_combo.currentIndex(),
             "connect_mode_index": self._mode_combo.currentIndex(),
             "y_auto": self._y_auto_btn.isChecked(),
