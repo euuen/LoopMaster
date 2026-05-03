@@ -1,0 +1,7 @@
+rich>=13.0
+PyYAML>=6.0
+openpyxl>=3.0
+pyocd>=0.36
+pyside6>=6.6
+pyqtgraph>=0.13
+numpy>=1.24

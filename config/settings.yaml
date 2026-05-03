@@ -1,0 +1,26 @@
+parser:
+  elf:
+    show_internal_symbols: false
+    exclude_symbol_types:
+      - STT_NOTYPE
+      - STT_SECTION
+      - STT_FILE
+
+  dwarf:
+    max_type_depth: 10
+    resolve_typedefs: true
+
+  struct_layout:
+    show_padding: true
+    show_total_size: true
+
+  output:
+    default_format: table
+    csv_delimiter: ","
+    excel_sheet_name: Variables
+    table_max_width: 120
+
+scope:
+  swd_freq: 4000000
+  sample_rate: 100
+  buffer_seconds: 10

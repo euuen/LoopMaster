@@ -1,0 +1,34 @@
+# 虚拟环境
+.venv/
+venv/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 日志
+logs/
+*.log
+
+# 输出产物
+output/
+
+# 编辑器配置
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 本地配置
+loopmaster.json
+.claude/
+~/
+
+# 用户输入文件 (ELF/MAP)
+input_files/
+
+# 系统文件
+.DS_Store
+Thumbs.db
