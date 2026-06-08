@@ -147,6 +147,32 @@ class SWDBackend:
         else:
             raise ValueError(f"不支持的读取宽度: {width}")
 
+    def write(self, address: int, value: int, width: int) -> None:
+        """通过 MEM-AP 直接写入内存。"""
+        if not self._ap:
+            raise RuntimeError("未连接探针")
+        ap = self._ap
+
+        if width == 4:
+            ap.write_memory(address, value, transfer_size=32)
+        elif width == 2:
+            word_addr = address & ~0x3
+            shift = (address & 0x3) * 8
+            mask = 0xFFFF << shift
+            old = ap.read_memory(word_addr, transfer_size=32)
+            ap.write_memory(word_addr, (old & ~mask) | ((value & 0xFFFF) << shift), transfer_size=32)
+        elif width == 1:
+            word_addr = address & ~0x3
+            shift = (address & 0x3) * 8
+            mask = 0xFF << shift
+            old = ap.read_memory(word_addr, transfer_size=32)
+            ap.write_memory(word_addr, (old & ~mask) | ((value & 0xFF) << shift), transfer_size=32)
+        elif width == 8:
+            ap.write_memory(address, value & 0xFFFFFFFF, transfer_size=32)
+            ap.write_memory(address + 4, (value >> 32) & 0xFFFFFFFF, transfer_size=32)
+        else:
+            raise ValueError(f"不支持的写入宽度: {width}")
+
     def read_variable(self, address: int, type_info: TypeInfo) -> float:
         if self._decoder is None:
             self._decoder = _TypeDecoder(self)

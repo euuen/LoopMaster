@@ -23,6 +23,7 @@ class VariableInventory:
 
         variables: list[Variable] = []
         seen_names: set[str] = set()
+        seen_addrs: dict[int, int] = {}  # addr -> index into variables
 
         for sym in symbols:
             if sym.sym_type != "OBJECT":
@@ -41,30 +42,90 @@ class VariableInventory:
             else:
                 size = sym.size
 
+            # LTO: strip .N suffix from name if DWARF provides the correct base name
+            display_name = sym.name
+            if dv and dv.name != sym.name and _match_lto_suffix(sym.name, dv.name):
+                display_name = dv.name
+
+            # LTO dedup: same address — prefer DWARF-named entry
+            prev_idx = seen_addrs.get(sym.address)
+            if prev_idx is not None:
+                prev_var = variables[prev_idx]
+                prev_has_type = prev_var.type_info is not None
+                cur_has_type = type_info is not None
+                prev_is_lto = bool(_LTO_SUFFIX_RE.match(prev_var.name))
+                cur_is_lto = bool(_LTO_SUFFIX_RE.match(display_name))
+                # Replace previous entry if current is strictly better
+                if (not prev_has_type and cur_has_type) or (prev_is_lto and not cur_is_lto):
+                    variables[prev_idx] = Variable(
+                        name=display_name, address=sym.address, size=size,
+                        type_info=type_info, symbol=sym, file_name=file_name,
+                    )
+                    if prev_var.name in seen_names:
+                        seen_names.discard(prev_var.name)
+                    seen_names.add(display_name)
+                    seen_addrs[sym.address] = prev_idx
+                continue
+
             variables.append(Variable(
-                name=sym.name,
+                name=display_name,
                 address=sym.address,
                 size=size,
                 type_info=type_info,
                 symbol=sym,
                 file_name=file_name,
             ))
-            seen_names.add(sym.name)
+            seen_names.add(display_name)
+            seen_addrs[sym.address] = len(variables) - 1
 
         # DWARF-only variables
         if self.dwarf_db and self.dwarf_db.has_debug_info():
             for dv in self.dwarf_db.variables:
-                if dv.name not in seen_names and dv.address != 0:
-                    map_file = self.symbol_to_file.get(dv.name, "")
-                    if map_file:
-                        dv.file_name = map_file
-                    elif dv.file_name:
-                        dv.file_name = _clean_dwarf_path(dv.file_name)
-                    variables.append(dv)
-                    seen_names.add(dv.name)
+                if dv.name in seen_names:
+                    continue
+                if dv.address == 0:
+                    continue
+                # LTO dedup by address: update existing entry with DWARF name/type
+                prev_idx = seen_addrs.get(dv.address)
+                if prev_idx is not None:
+                    prev_var = variables[prev_idx]
+                    prev_has_type = prev_var.type_info is not None
+                    prev_is_lto = bool(_LTO_SUFFIX_RE.match(prev_var.name))
+                    # DWARF name is better — upgrade
+                    if not prev_has_type or prev_is_lto:
+                        if prev_var.name in seen_names:
+                            seen_names.discard(prev_var.name)
+                        seen_names.add(dv.name)
+                        variables[prev_idx] = Variable(
+                            name=dv.name, address=dv.address, size=dv.size,
+                            type_info=dv.type_info, symbol=prev_var.symbol,
+                            file_name=_clean_dwarf_path(dv.file_name) or prev_var.file_name,
+                        )
+                        seen_addrs[dv.address] = prev_idx
+                    continue
+
+                map_file = self.symbol_to_file.get(dv.name, "")
+                if map_file:
+                    dv.file_name = map_file
+                elif dv.file_name:
+                    dv.file_name = _clean_dwarf_path(dv.file_name)
+                variables.append(dv)
+                seen_names.add(dv.name)
+                seen_addrs[dv.address] = len(variables) - 1
 
         variables.sort(key=lambda v: v.address)
         return variables
+
+
+import re as _re
+
+# LTO generates duplicates like "var.3", "var.4" for "var" across CUs
+_LTO_SUFFIX_RE = _re.compile(r"^(.*)(?:\.\d+)$")
+
+def _match_lto_suffix(suffixed: str, base: str) -> bool:
+    """Return True if `suffixed` is base with a .N suffix (e.g. 'foo.4' matches 'foo')."""
+    m = _LTO_SUFFIX_RE.match(suffixed)
+    return m is not None and m.group(1) == base
 
 
 def _clean_dwarf_path(path: str) -> str:

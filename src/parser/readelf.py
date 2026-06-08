@@ -38,6 +38,23 @@ _TYPE_REF_RE = re.compile(r"<(0x[0-9a-fA-F]+)>")
 # DW_OP_addr comment from readelf
 _OP_ADDR_RE = re.compile(r"DW_OP_addr:\s*([0-9a-fA-F]+)")
 
+# DW_OP_plus_uconst in block expressions (e.g. "2 byte block: 23 4 (DW_OP_plus_uconst: 4)")
+_BLOCK_PLUS_UCONST_RE = re.compile(r"DW_OP_plus_uconst:\s*(\d+)")
+
+def _parse_int(raw: str, default: int = 0) -> int:
+    """Safely parse an attribute value that may be hex (0x...), decimal, or a DWARF block expression."""
+    if not raw or raw.strip() == "":
+        return default
+    s = raw.strip()
+    # Hex or decimal integer
+    if re.match(r'^\s*-?(?:0x[0-9a-fA-F]+|[0-9]+)\s*$', s):
+        return int(s, 0)
+    # DWARF block expression like "2 byte block: 23 4 (DW_OP_plus_uconst: 4)"
+    m = _BLOCK_PLUS_UCONST_RE.search(s)
+    if m:
+        return int(m.group(1))
+    return default
+
 
 def run_readelf(filepath: str | Path, *args: str) -> str:
     result = subprocess.run(
@@ -265,12 +282,24 @@ def parse_debug_info(filepath: str | Path) -> DwarfDB:
         if ti is not None:
             db.types[offset] = ti
 
-    # Pass 2: collect structs
+    # Pass 2: collect structs (named)
     for offset, die in all_dies.items():
         ti = db.types.get(offset)
         if isinstance(ti, StructType):
             if ti.name and ti.name != "<anonymous>":
                 db.structs[ti.name] = ti
+
+    # Pass 2.5: link typedef names to their underlying anonymous structs
+    # e.g. "typedef struct { ... } IMU_Data_t;" → allow lookup by IMU_Data_t
+    for offset, die in all_dies.items():
+        ti = db.types.get(offset)
+        if isinstance(ti, TypedefType):
+            ut = ti.underlying_type
+            while isinstance(ut, TypedefType):
+                ut = ut.underlying_type
+            if isinstance(ut, StructType):
+                if ti.name and ti.name not in db.structs:
+                    db.structs[ti.name] = ut
 
     # Pass 3: collect variables
     for offset, die in all_dies.items():
@@ -324,7 +353,7 @@ def _die_to_type_info(die: RawDie, all_dies: dict[int, RawDie], visiting: set[in
 
         if tag == "DW_TAG_base_type":
             name = _attr_value_stripped(die.attrs.get("DW_AT_name", ""))
-            size = int(die.attrs.get("DW_AT_byte_size", "0"))
+            size = _parse_int(die.attrs.get("DW_AT_byte_size", "0"))
             enc_str = die.attrs.get("DW_AT_encoding", "")
             encoding = _attr_value_stripped(enc_str)
             return BaseType(name=name, byte_size=size, encoding=encoding)
@@ -337,13 +366,13 @@ def _die_to_type_info(die: RawDie, all_dies: dict[int, RawDie], visiting: set[in
             for child in die.children:
                 if child.tag in ("DW_TAG_member", "DW_TAG_inheritance"):
                     m_name = _attr_value_stripped(child.attrs.get("DW_AT_name", ""))
-                    m_offset = int(child.attrs.get("DW_AT_data_member_location", "0"))
+                    m_offset = _parse_int(child.attrs.get("DW_AT_data_member_location", "0"))
                     m_type_ref = _parse_type_ref(child.attrs.get("DW_AT_type", ""))
                     m_type = None
                     if m_type_ref and m_type_ref in all_dies:
                         m_type = _die_to_type_info(all_dies[m_type_ref], all_dies, visiting)
-                    bit_size = int(child.attrs.get("DW_AT_bit_size", "0"))
-                    bit_offset = int(child.attrs.get("DW_AT_bit_offset", "0"))
+                    bit_size = _parse_int(child.attrs.get("DW_AT_bit_size", "0"))
+                    bit_offset = _parse_int(child.attrs.get("DW_AT_bit_offset", "0"))
                     members.append(MemberInfo(
                         name=m_name, offset=m_offset, type_info=m_type,
                         bit_size=bit_size, bit_offset=bit_offset,
@@ -352,12 +381,12 @@ def _die_to_type_info(die: RawDie, all_dies: dict[int, RawDie], visiting: set[in
 
         if tag == "DW_TAG_enumeration_type":
             name = _attr_value_stripped(die.attrs.get("DW_AT_name", ""))
-            size = int(die.attrs.get("DW_AT_byte_size", "0"))
+            size = _parse_int(die.attrs.get("DW_AT_byte_size", "0"))
             values = []
             for child in die.children:
                 if child.tag == "DW_TAG_enumerator":
                     c_name = _attr_value_stripped(child.attrs.get("DW_AT_name", ""))
-                    c_val = int(child.attrs.get("DW_AT_const_value", "0"))
+                    c_val = _parse_int(child.attrs.get("DW_AT_const_value", "0"))
                     values.append((c_name, c_val))
             return EnumType(name=name, size=size, values=values)
 
@@ -387,23 +416,20 @@ def _die_to_type_info(die: RawDie, all_dies: dict[int, RawDie], visiting: set[in
                     upper = child.attrs.get("DW_AT_upper_bound", "")
                     cnt = child.attrs.get("DW_AT_count", "")
                     if upper:
-                        count = int(upper) + 1
+                        count = _parse_int(upper, 0) + 1
                     elif cnt:
-                        count = int(cnt)
+                        count = _parse_int(cnt, 0)
             elem_size = _estimate_size(elem_type) if elem_type else 0
             return ArrayType(element_type=elem_type, count=count, total_size=count * elem_size)
 
-        if tag == "DW_TAG_const_type":
+        if tag in ("DW_TAG_const_type", "DW_TAG_volatile_type", "DW_TAG_restrict_type"):
             type_ref = _parse_type_ref(die.attrs.get("DW_AT_type", ""))
             if type_ref and type_ref in all_dies:
                 return _die_to_type_info(all_dies[type_ref], all_dies, visiting)
             return None
 
-        if tag == "DW_TAG_volatile_type":
-            type_ref = _parse_type_ref(die.attrs.get("DW_AT_type", ""))
-            if type_ref and type_ref in all_dies:
-                return _die_to_type_info(all_dies[type_ref], all_dies, visiting)
-            return None
+        if tag == "DW_TAG_unspecified_type":
+            return BaseType(name="void", byte_size=0, encoding="void")
 
         if tag == "DW_TAG_subroutine_type":
             type_ref = _parse_type_ref(die.attrs.get("DW_AT_type", ""))

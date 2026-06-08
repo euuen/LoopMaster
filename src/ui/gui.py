@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem, QAbstractItemView, QTableWidget, QTableWidgetItem,
     QComboBox,
 )
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QEvent
 from PySide6.QtGui import QAction, QFont, QPalette, QColor
 from PySide6.QtWidgets import QGraphicsProxyWidget
 
@@ -46,6 +46,7 @@ COLORS = [
 PRESET_FRAME_RATES = [12, 24, 30, 60, 120]
 FRAME_RATE_DEFAULT = 60
 TIME_WINDOW_DEFAULT = 10
+PTR_NULL_THRESHOLD = 0x1000  # 地址 < 4K 视为空指针
 BUFFER_SECONDS = 300
 MAX_STRUCT_DEPTH = 6
 
@@ -117,10 +118,13 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1100, 600)
 
         self._elf_path: Optional[Path] = None
+        self._elf_mtime: float = 0.0
         self._variables: list[Variable] = []
         self._monitored: set[str] = set()
         self._monitor_list: list[tuple[str, int, object]] = []
         self._registry: dict[str, tuple[int, TypeInfo]] = {}
+        self._deref_paths: dict[str, tuple[int, int, int]] = {}  # path → (ptr_addr, member_offset, struct_size)
+        self._visible_vars: set[str] = set()                  # 在图上显示的变量路径
 
         self._backend = SWDBackend()
         self._collector = DataCollector()
@@ -173,6 +177,35 @@ class MainWindow(QMainWindow):
                 if "y_auto" in cfg:
                     self._y_auto_btn.setChecked(cfg["y_auto"])
                 self.setWindowTitle(f"LoopMaster Scope — {Path(elf).name}")
+
+        # 启动后自动扫描探针
+        QTimer.singleShot(500, self._on_scan_probes_ui)
+
+    def changeEvent(self, event):
+        """窗口激活时检查 ELF 文件是否有更新。"""
+        if event.type() == QEvent.ActivationChange and self.isActiveWindow():
+            self._check_elf_reload()
+        super().changeEvent(event)
+
+    def _check_elf_reload(self):
+        """ELF 文件有修改则自动重新加载。"""
+        if not self._elf_path or not self._elf_path.exists():
+            return
+        try:
+            new_mtime = os.path.getmtime(self._elf_path)
+        except OSError:
+            return
+        if new_mtime > self._elf_mtime:
+            logger.info(f"检测到 ELF 更新: {self._elf_path.name}")
+            self._elf_mtime = new_mtime
+            # 停止采样并重新加载
+            was_running = self._collector.is_running
+            if was_running:
+                self._on_stop()
+            self._load_variables()
+            if was_running and self._backend.is_connected:
+                # 如果有勾选变量则自动恢复采样
+                self._on_start()
 
     # ================================================================
     #  Menu
@@ -317,6 +350,15 @@ class MainWindow(QMainWindow):
         self._btn_connect.clicked.connect(self._on_connect_ui)
         layout.addWidget(self._btn_connect)
 
+        # 复位按钮
+        self._btn_reset = QPushButton("↺ 复位")
+        self._btn_reset.setObjectName("resetBtn")
+        self._btn_reset.setFixedHeight(30)
+        self._btn_reset.setFixedWidth(70)
+        self._btn_reset.clicked.connect(self._on_reset_ui)
+        self._btn_reset.setEnabled(False)
+        layout.addWidget(self._btn_reset)
+
         # 状态指示
         self._conn_indicator = QLabel("●")
         self._conn_indicator.setStyleSheet("color: #e04040; font-size: 16px; padding: 0px 4px;")
@@ -341,6 +383,7 @@ class MainWindow(QMainWindow):
             self._conn_label.setStyleSheet("color: #40e060; font-weight: bold; font-size: 9pt;")
             self._btn_connect.setText("断开")
             self._btn_connect.setObjectName("disconnectBtn")
+            self._btn_reset.setEnabled(True)
             self._conn_info.setText(
                 f"目标: {self._backend.target_name}  |  "
                 f"SWD: ~{self._backend.swd_freq_khz} kHz"
@@ -355,6 +398,7 @@ class MainWindow(QMainWindow):
             self._conn_label.setStyleSheet("color: #8080a0; font-size: 9pt;")
             self._btn_connect.setText("连接")
             self._btn_connect.setObjectName("connectBtn")
+            self._btn_reset.setEnabled(False)
             self._conn_info.setText("")
             self._probe_combo.setEnabled(True)
             self._btn_scan.setEnabled(True)
@@ -447,7 +491,6 @@ class MainWindow(QMainWindow):
         # -- Real-time value table --
         table_frame = QFrame()
         table_frame.setObjectName("panel")
-        table_frame.setMaximumHeight(140)
         table_layout = QVBoxLayout(table_frame)
         table_layout.setContentsMargins(8, 6, 8, 6)
 
@@ -456,19 +499,25 @@ class MainWindow(QMainWindow):
         table_layout.addWidget(table_header)
 
         self._value_table = QTableWidget()
-        self._value_table.setColumnCount(3)
-        self._value_table.setHorizontalHeaderLabels(["变量", "数值", "类型"])
+        self._value_table.setColumnCount(4)
+        self._value_table.setHorizontalHeaderLabels(["", "变量", "数值", "类型"])
         self._value_table.setAlternatingRowColors(True)
-        self._value_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._value_table.setEditTriggers(QAbstractItemView.DoubleClicked)
         self._value_table.setSelectionMode(QAbstractItemView.NoSelection)
-        self._value_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self._value_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self._value_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+        self._value_table.setColumnWidth(0, 30)
+        self._value_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self._value_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self._value_table.setMaximumHeight(100)
+        self._value_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self._value_table.setRowCount(0)
         table_layout.addWidget(self._value_table)
+        self._value_table.itemChanged.connect(self._on_visibility_toggled)
 
-        tab2_layout.addWidget(table_frame)
+        # -- Splitter: 值表 + 示波器 --
+        self._scope_splitter = QSplitter(Qt.Vertical)
+        self._scope_splitter.addWidget(table_frame)
+
+        tab2_layout.addWidget(self._scope_splitter, stretch=1)
 
         # -- Scrolling plot --
         self._plot_widget = pg.GraphicsLayoutWidget()
@@ -506,7 +555,7 @@ class MainWindow(QMainWindow):
         self._y_proxy.setZValue(100)
         self._plot.getViewBox().sigResized.connect(self._position_y_btn)
 
-        tab2_layout.addWidget(self._plot_widget, stretch=1)
+        self._scope_splitter.addWidget(self._plot_widget)
 
         # -- Controls bar --
         ctrl = QFrame()
@@ -598,6 +647,11 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "错误", f"解析 ELF 失败: {e}")
             return
+        # 记录文件修改时间
+        try:
+            self._elf_mtime = os.path.getmtime(self._elf_path)
+        except OSError:
+            self._elf_mtime = 0.0
         self._populate_tree()
 
     def _find_map_file(self) -> Optional[Path]:
@@ -628,6 +682,7 @@ class MainWindow(QMainWindow):
         text = self._filter_edit.text().lower()
         self._tree.clear()
         self._registry.clear()
+        self._deref_paths.clear()
 
         # Filter variables
         display = []
@@ -636,6 +691,16 @@ class MainWindow(QMainWindow):
                 concrete = resolve_type(v.type_info)
                 if isinstance(concrete, StructType):
                     if not self._any_member_matches(text, concrete, v.name):
+                        continue
+                elif isinstance(concrete, PointerType):
+                    # 指针→结构体：搜索指向的结构体内部
+                    pointed = concrete.pointed_type
+                    while isinstance(pointed, TypedefType):
+                        pointed = pointed.underlying_type
+                    if isinstance(pointed, StructType):
+                        if not self._any_member_matches(text, pointed, v.name):
+                            continue
+                    else:
                         continue
                 else:
                     continue
@@ -690,22 +755,59 @@ class MainWindow(QMainWindow):
             if isinstance(inner, StructType):
                 if self._any_member_matches(text, inner, full):
                     return True
+            # 指针→结构体成员也递归搜索
+            if isinstance(inner, PointerType):
+                pointed = inner.pointed_type
+                while isinstance(pointed, TypedefType):
+                    pointed = pointed.underlying_type
+                if isinstance(pointed, StructType):
+                    if self._any_member_matches(text, pointed, full):
+                        return True
         return False
+
+    @staticmethod
+    def _unwrap_type(ti: TypeInfo) -> TypeInfo:
+        """递归解包 TypedefType 和 PointerType→StructType 的穿透。"""
+        ti = resolve_type(ti)
+        if isinstance(ti, PointerType):
+            pointed = ti.pointed_type
+            while isinstance(pointed, TypedefType):
+                pointed = pointed.underlying_type
+            return pointed
+        return ti
 
     def _add_variable_item(self, v: Variable, depth: int = 0,
                            parent_item: Optional[QTreeWidgetItem] = None,
-                           path_prefix: str = ""):
+                           path_prefix: str = "",
+                           is_ptr_parent: bool = False,
+                           ptr_parent_addr: int = 0):
         concrete = resolve_type(v.type_info)
         is_struct = isinstance(concrete, StructType)
         full_path = f"{path_prefix}.{v.name}" if path_prefix else v.name
 
-        if is_struct and depth < MAX_STRUCT_DEPTH and concrete.members:
+        # 检测指针→结构体
+        is_ptr_to_struct = False
+        ptr_struct = None
+        if isinstance(concrete, PointerType):
+            pointed = concrete.pointed_type
+            while isinstance(pointed, TypedefType):
+                pointed = pointed.underlying_type
+            if isinstance(pointed, StructType) and pointed.members:
+                is_ptr_to_struct = True
+                ptr_struct = pointed
+
+        # 决定要展开的结构体
+        struct_to_expand = concrete if is_struct else (ptr_struct if is_ptr_to_struct else None)
+        can_expand = struct_to_expand is not None and depth < MAX_STRUCT_DEPTH and struct_to_expand.members
+
+        if can_expand:
+            node_addr = v.address
             item = QTreeWidgetItem() if parent_item is None else QTreeWidgetItem(parent_item)
             item.setText(0, v.name)
-            item.setText(1, f"0x{v.address:08X}")
+            item.setText(1, f"0x{node_addr:08X}")
             item.setText(2, format_type(v.type_info))
             item.setData(0, ROLE_PATH, full_path)
-            item.setData(0, ROLE_ADDR, v.address)
+            item.setData(0, ROLE_ADDR, node_addr)
             item.setData(0, ROLE_TYPE, v.type_info)
             item.setFlags(item.flags() | Qt.ItemIsSelectable)
 
@@ -719,21 +821,46 @@ class MainWindow(QMainWindow):
             if parent_item is None:
                 self._tree.addTopLevelItem(item)
 
-            sorted_members = sorted(concrete.members, key=lambda m: m.offset)
+            sorted_members = sorted(struct_to_expand.members, key=lambda m: m.offset)
 
             for member in sorted_members:
-                member_addr = v.address + member.offset
+                # ── 地址计算 ──
+                if is_ptr_to_struct:
+                    # 指针→结构体: 运行时地址 = *ptr + offset
+                    # _registry 存指针地址, 用 _deref_paths 标记
+                    member_addr = v.address
+                else:
+                    member_addr = v.address + member.offset
+
                 member_concrete = resolve_type(member.type_info)
                 member_is_struct = isinstance(member_concrete, StructType)
 
-                if member_is_struct and depth + 1 < MAX_STRUCT_DEPTH and member_concrete.members:
-                    display_ti = member.type_info if isinstance(member.type_info, TypedefType) else member_concrete
+                # 检测嵌套指针→结构体
+                member_is_ptr_to_struct = False
+                member_ptr_struct = None
+                if isinstance(member_concrete, PointerType):
+                    m_pointed = member_concrete.pointed_type
+                    while isinstance(m_pointed, TypedefType):
+                        m_pointed = m_pointed.underlying_type
+                    if isinstance(m_pointed, StructType) and m_pointed.members:
+                        member_is_ptr_to_struct = True
+                        member_ptr_struct = m_pointed
+
+                member_struct = member_concrete if member_is_struct else (member_ptr_struct if member_is_ptr_to_struct else None)
+                member_can_expand = member_struct is not None and depth + 1 < MAX_STRUCT_DEPTH and member_struct.members
+
+                if member_can_expand:
+                    # 递归展开
+                    display_ti = member.type_info
                     pseudo = Variable(
                         name=member.name, address=member_addr,
-                        size=member_concrete.size, type_info=display_ti,
+                        size=member_struct.size, type_info=display_ti,
                     )
-                    self._add_variable_item(pseudo, depth + 1, item, full_path)
+                    self._add_variable_item(pseudo, depth + 1, item, full_path,
+                                            is_ptr_parent=is_ptr_to_struct,
+                                            ptr_parent_addr=v.address if is_ptr_to_struct else ptr_parent_addr)
                 else:
+                    # 叶子节点
                     member_path = f"{full_path}.{member.name}"
                     child = QTreeWidgetItem(item)
                     child.setText(0, member.name)
@@ -756,7 +883,12 @@ class MainWindow(QMainWindow):
                     child.setData(0, ROLE_ADDR, member_addr)
                     child.setData(0, ROLE_TYPE, member.type_info)
 
-                    self._registry[member_path] = (member_addr, member.type_info)
+                    # 注册: 指针成员的地址用指针变量地址 + 标记
+                    if is_ptr_to_struct:
+                        self._registry[member_path] = (v.address, member.type_info)
+                        self._deref_paths[member_path] = (v.address, member.offset, ptr_struct.size)
+                    else:
+                        self._registry[member_path] = (member_addr, member.type_info)
 
         else:
             item = QTreeWidgetItem() if parent_item is None else QTreeWidgetItem(parent_item)
@@ -789,6 +921,7 @@ class MainWindow(QMainWindow):
                 selected_paths.add(path)
 
         self._monitored = selected_paths
+        self._visible_vars = set(selected_paths)  # 默认全部可见
         self._update_selected_list()
         self._idle_read()
 
@@ -895,11 +1028,26 @@ class MainWindow(QMainWindow):
             self._led.setStyleSheet("color: #40e060; font-size: 14px;")
             logger.info("探针已连接 (模式=%s, 目标=%s, SWD=%dkHz)",
                 connect_mode, self._backend.target_name, self._backend.swd_freq_khz)
+            self._btn_reset.setEnabled(True)
             self._idle_read()
+            # 连接后自动开始采样
+            self._on_start()
         else:
             logger.warning("连接失败: 未找到目标芯片")
             QMessageBox.warning(self, "连接失败",
                 "未找到目标芯片，请检查接线和供电。")
+
+    def _on_reset_ui(self):
+        if not self._backend.is_connected or not self._backend._target:
+            return
+        logger.info("复位目标芯片")
+        try:
+            self._backend._target.reset_and_halt()
+            self._backend._target.resume()
+            self._sb_label.setText(f"  探针: 已连接  |  目标: {self._backend.target_name}  (已复位)")
+            logger.info("复位完成")
+        except Exception as e:
+            logger.warning(f"复位失败: {e}")
 
     def _on_disconnect_ui(self):
         logger.info("断开探针连接")
@@ -952,11 +1100,25 @@ class MainWindow(QMainWindow):
         self._setup_fast_path()
 
         # Set up value table for monitored variables
+        self._visible_vars.clear()
         self._value_table.setRowCount(len(self._monitor_list))
+        self._value_table.blockSignals(True)
         for row, (name, _, ti) in enumerate(self._monitor_list):
-            self._value_table.setItem(row, 0, QTableWidgetItem(name))
-            self._value_table.setItem(row, 1, QTableWidgetItem("—"))
-            self._value_table.setItem(row, 2, QTableWidgetItem(format_type(ti)))
+            cb_item = QTableWidgetItem()
+            cb_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            cb_item.setCheckState(Qt.Checked)
+            self._value_table.setItem(row, 0, cb_item)
+            name_item = QTableWidgetItem(name)
+            name_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self._value_table.setItem(row, 1, name_item)
+            val_item = QTableWidgetItem("—")
+            val_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+            self._value_table.setItem(row, 2, val_item)
+            type_item = QTableWidgetItem(format_type(ti))
+            type_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self._value_table.setItem(row, 3, type_item)
+            self._visible_vars.add(name)
+        self._value_table.blockSignals(False)
         self._value_update_counter = 0
 
         self._plot.clear()
@@ -1069,10 +1231,51 @@ class MainWindow(QMainWindow):
         self._fast_direct = []   # [(deque, word_addr), ...]
         self._fast_complex = []  # [(deque, word_addr, bo, w, sgn, flt), ...]
         self._fast_names = []    # [name, ...]
+        self._fast_deref = []    # [(ptr_addr, struct_words, [(word_idx, bo, w, wc, sgn, flt, buf), ...])]
 
-        # 构建所有变量的读取计划
+        # 收集解引用成员，分组为按指针地址
+        deref_members = []  # [(name, addr, ti), ...]
+        deref_by_ptr: dict[int, list] = {}
+        for name, addr, ti in self._monitor_list:
+            if name in self._deref_paths:
+                deref_members.append((name, addr, ti))
+
+        # 构建解引用读取组
+        if deref_members:
+            from collections import defaultdict
+            deref_groups = defaultdict(list)
+            for name, addr, ti in deref_members:
+                ptr_addr, member_offset, struct_size = self._deref_paths[name]
+                buf = c._buffers.get(name)
+                if buf is None:
+                    continue
+                deref_groups[ptr_addr].append((name, member_offset, ti, buf))
+
+            for ptr_addr, members in deref_groups.items():
+                # 从任一成员取结构体大小（同指针共享）
+                struct_size = self._deref_paths[members[0][0]][2]
+                struct_words = (struct_size + 3) // 4
+
+                member_plans = []
+                for _, member_offset, ti, buf in members:
+                    _, bo, w, wc, sgn, flt = decoder.make_plan(0, ti)
+                    word_idx = member_offset // 4
+                    byte_off = (member_offset % 4) + bo
+                    word_idx += byte_off // 4
+                    byte_off = byte_off % 4
+                    member_plans.append((word_idx, byte_off, w, wc, sgn, flt, buf))
+
+                self._fast_deref.append((ptr_addr, struct_words, member_plans))
+                self._fast_names.extend(m[0] for m in members)
+                logger.info(f"解引用组: ptr=0x{ptr_addr:08X}, "
+                            f"struct={struct_size}B({struct_words}字), "
+                            f"{len(members)}个成员")
+
+        # 构建所有变量的读取计划（排除解引用成员）
         all_plans = []  # [(wa, bo, w, wc, sgn, flt, buf), ...]
         for name, addr, ti in self._monitor_list:
+            if name in self._deref_paths:
+                continue  # 已在上面处理
             wa, bo, w, wc, sgn, flt = decoder.make_plan(addr, ti)
             buf = c._buffers.get(name)
             if buf is None:
@@ -1160,6 +1363,32 @@ class MainWindow(QMainWindow):
                     raw = ap.read_memory(wa, transfer_size=32)
                     buf.append(_extract_val(raw, byte_offset=bo, width=w,
                                             is_signed=sgn, is_float=flt))
+
+            # ── 解引用读取（指针→结构体）──
+            for ptr_addr, struct_words, member_plans in self._fast_deref:
+                try:
+                    ptr_val = ap.read_memory(ptr_addr, transfer_size=32) & 0xFFFFFFFF
+                except Exception:
+                    ptr_val = 0
+
+                if ptr_val < PTR_NULL_THRESHOLD:
+                    for _, _, _, _, _, _, buf in member_plans:
+                        buf.append(float('nan'))
+                    continue
+
+                try:
+                    struct_data = ap.read_memory_block32(ptr_val, struct_words)
+                    if not isinstance(struct_data, list):
+                        struct_data = list(struct_data)
+                except Exception:
+                    for _, _, _, _, _, _, buf in member_plans:
+                        buf.append(float('nan'))
+                    continue
+
+                for word_idx, bo, w, wc, sgn, flt, buf in member_plans:
+                    buf.append(_extract_val(struct_data, word_idx=word_idx,
+                                            byte_offset=bo, width=w, word_count=wc,
+                                            is_signed=sgn, is_float=flt))
         except Exception:
             pass  # USB 偶发错误，跳过本次采样
 
@@ -1171,7 +1400,7 @@ class MainWindow(QMainWindow):
             c._actual_rate = c._sample_count / elapsed if elapsed > 0 else 0
             tick_ms = (time.perf_counter() - tick_start) * 1000
             logger.debug(f"采样耗时: {tick_ms:.1f}ms | 速率: {c._actual_rate:.0f}Hz | "
-                         f"变量: direct={len(self._fast_direct)} complex={len(self._fast_complex)}")
+                         f"变量: direct={len(self._fast_direct)} complex={len(self._fast_complex)} deref={len(self._fast_deref)}")
 
     def _tight_sample_loop(self):
         """无限制模式 — 自适应深度流水线批量采样。
@@ -1216,6 +1445,28 @@ class MainWindow(QMainWindow):
                     c._sample_count += 1
                     for (_, _, _, _, _, _, buf), val in zip(block_plans, sample_vals):
                         buf.append(val)
+                    # ── 解引用读取（逐样本，不流水线）──
+                    for ptr_addr, struct_words, member_plans in self._fast_deref:
+                        try:
+                            pv = ap.read_memory(ptr_addr, transfer_size=32) & 0xFFFFFFFF
+                        except Exception:
+                            pv = 0
+                        if pv < PTR_NULL_THRESHOLD:
+                            for _, _, _, _, _, _, buf in member_plans:
+                                buf.append(float('nan'))
+                            continue
+                        try:
+                            sd = ap.read_memory_block32(pv, struct_words)
+                            if not isinstance(sd, list):
+                                sd = list(sd)
+                        except Exception:
+                            for _, _, _, _, _, _, buf in member_plans:
+                                buf.append(float('nan'))
+                            continue
+                        for word_idx, bo, w, wc, sgn, flt, buf in member_plans:
+                            buf.append(_extract_val(sd, word_idx=word_idx,
+                                                    byte_offset=bo, width=w, word_count=wc,
+                                                    is_signed=sgn, is_float=flt))
             except Exception:
                 # 流水线失败时回退单次块读取
                 try:
@@ -1230,6 +1481,28 @@ class MainWindow(QMainWindow):
                                                     width=w, is_signed=sgn, is_float=flt))
                         else:
                             buf.append(float(BACKEND.read(wa + bo, w)))
+                    # ── 解引用读取 ──
+                    for ptr_addr, struct_words, member_plans in self._fast_deref:
+                        try:
+                            ptr_val = ap.read_memory(ptr_addr, transfer_size=32) & 0xFFFFFFFF
+                        except Exception:
+                            ptr_val = 0
+                        if ptr_val < PTR_NULL_THRESHOLD:
+                            for _, _, _, _, _, _, buf in member_plans:
+                                buf.append(float('nan'))
+                            continue
+                        try:
+                            sd = ap.read_memory_block32(ptr_val, struct_words)
+                            if not isinstance(sd, list):
+                                sd = list(sd)
+                        except Exception:
+                            for _, _, _, _, _, _, buf in member_plans:
+                                buf.append(float('nan'))
+                            continue
+                        for word_idx, bo, w, wc, sgn, flt, buf in member_plans:
+                            buf.append(_extract_val(sd, word_idx=word_idx,
+                                                    byte_offset=bo, width=w, word_count=wc,
+                                                    is_signed=sgn, is_float=flt))
                     ts_deque.append(now - t0)
                     c._sample_count += 1
                 except Exception:
@@ -1249,6 +1522,28 @@ class MainWindow(QMainWindow):
                             buf, wa, bo, w, sgn, flt = item
                             raw = ap.read_memory(wa, transfer_size=32)
                             buf.append(_extract_val(raw, byte_offset=bo, width=w,
+                                                    is_signed=sgn, is_float=flt))
+                    # ── 解引用读取 ──
+                    for ptr_addr, struct_words, member_plans in self._fast_deref:
+                        try:
+                            ptr_val = ap.read_memory(ptr_addr, transfer_size=32) & 0xFFFFFFFF
+                        except Exception:
+                            ptr_val = 0
+                        if ptr_val < PTR_NULL_THRESHOLD:
+                            for _, _, _, _, _, _, buf in member_plans:
+                                buf.append(float('nan'))
+                            continue
+                        try:
+                            sd = ap.read_memory_block32(ptr_val, struct_words)
+                            if not isinstance(sd, list):
+                                sd = list(sd)
+                        except Exception:
+                            for _, _, _, _, _, _, buf in member_plans:
+                                buf.append(float('nan'))
+                            continue
+                        for word_idx, bo, w, wc, sgn, flt, buf in member_plans:
+                            buf.append(_extract_val(sd, word_idx=word_idx,
+                                                    byte_offset=bo, width=w, word_count=wc,
                                                     is_signed=sgn, is_float=flt))
                     ts_deque.append(time.perf_counter() - t0)
                     c._sample_count += 1
@@ -1290,10 +1585,12 @@ class MainWindow(QMainWindow):
         # 插值/抽取处理
         data = self._process_display_data(raw_data)
 
-        # 批量更新曲线
+        # 批量更新曲线（只更新可见的）
         latest_ts = 0.0
         for name, curve in self._plot_curves.items():
-            if name in data:
+            visible = name in self._visible_vars
+            curve.setVisible(visible)
+            if visible and name in data:
                 ts, vals = data[name]
                 if len(ts) > 0:
                     curve.setData(ts, vals)
@@ -1321,6 +1618,66 @@ class MainWindow(QMainWindow):
         self._value_update_counter = getattr(self, '_value_update_counter', 0) + 1
         if self._value_update_counter % max(1, fps // 5) == 0:
             self._update_value_table(data)
+
+    def _on_visibility_toggled(self, item):
+        """处理复选框切换和数值编辑。"""
+        if item.column() == 0:
+            # 复选框切换：更新可见变量集和曲线显示
+            name_item = self._value_table.item(item.row(), 1)
+            if name_item is None:
+                return
+            name = name_item.text()
+            if item.checkState() == Qt.Checked:
+                self._visible_vars.add(name)
+            else:
+                self._visible_vars.discard(name)
+            curve = self._plot_curves.get(name)
+            if curve:
+                curve.setVisible(item.checkState() == Qt.Checked)
+        elif item.column() == 2:
+            # 数值编辑：写入 MCU
+            if not self._backend.is_connected:
+                return
+            name_item = self._value_table.item(item.row(), 1)
+            if name_item is None:
+                return
+            name = name_item.text()
+            info = self._registry.get(name)
+            if info is None:
+                return
+            addr, ti = info[0], info[1]
+            text = item.text().strip()
+            if not text:
+                return
+            try:
+                value = float(text)
+                # 判断是否为解引用成员
+                if name in self._deref_paths:
+                    ptr_addr, member_offset, _ = self._deref_paths[name]
+                    # 先读指针值
+                    ptr_val = self._backend.read(ptr_addr, 4)
+                    if ptr_val < PTR_NULL_THRESHOLD:
+                        return
+                    target_addr = ptr_val + member_offset
+                    write_addr = target_addr
+                else:
+                    write_addr = addr
+                # 根据类型决定如何写入
+                from src.core.mem_backend import _TypeDecoder
+                decoder = _TypeDecoder(self._backend)
+                wa, bo, w, wc, sgn, flt = decoder.make_plan(write_addr, ti)
+                if flt and w == 4:
+                    import struct
+                    raw = struct.unpack('<I', struct.pack('<f', value))[0]
+                    self._backend.write(wa, raw, 4)
+                elif sgn:
+                    raw = int(value) & ((1 << (w * 8)) - 1)
+                    self._backend.write(wa, raw, min(w, 4))
+                else:
+                    raw = int(value) & ((1 << (w * 8)) - 1)
+                    self._backend.write(wa, raw, min(w, 4))
+            except (ValueError, OverflowError):
+                pass
 
     def _on_user_interact(self, vb):
         """用户手动缩放/平移时关闭 Y 自适应和 X 自动滚动。"""
@@ -1412,43 +1769,87 @@ class MainWindow(QMainWindow):
         t = self._value_table
         if t.rowCount() != len(names):
             t.setRowCount(len(names))
+        t.blockSignals(True)
         for row, name in enumerate(names):
             ts, vals = data[name]
             latest = f"{vals[-1]:.4g}" if len(vals) > 0 else "—"
-            # Name column
-            name_item = t.item(row, 0)
+            # Name column (col 1)
+            name_item = t.item(row, 1)
             if name_item is None:
                 name_item = QTableWidgetItem(name)
-                t.setItem(row, 0, name_item)
+                t.setItem(row, 1, name_item)
             else:
                 name_item.setText(name)
-            # Value column
-            val_item = t.item(row, 1)
+            # Value column (col 2)
+            val_item = t.item(row, 2)
             if val_item is None:
                 val_item = QTableWidgetItem(latest)
                 val_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                t.setItem(row, 1, val_item)
+                val_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+                t.setItem(row, 2, val_item)
             else:
-                val_item.setText(latest)
-            # Type column from registry
-            type_item = t.item(row, 2)
+                # 用户正在编辑此单元格时，不要覆盖文本
+                if not (t.state() == QAbstractItemView.EditingState and t.currentRow() == row):
+                    val_item.setText(latest)
+            # Type column from registry (col 3)
+            type_item = t.item(row, 3)
             if type_item is None:
                 info = self._registry.get(name)
                 type_str = format_type(info[1]) if info else ""
                 type_item = QTableWidgetItem(type_str)
-                t.setItem(row, 2, type_item)
+                t.setItem(row, 3, type_item)
+        t.blockSignals(False)
 
     def _idle_read(self):
         """Single-shot read when scope is not actively sampling.
         Runs on _idle_timer (~4Hz) so values display even without pressing START.
+        Also populates the value table structure even without probe connection.
         """
-        if not self._backend.is_connected:
-            return
         if self._collector.is_running:
             return
         if not self._monitored:
             if self._value_table.rowCount() > 0:
                 self._value_table.setRowCount(0)
+            return
+
+        # 先构建表格结构（名称 + 类型），无论探针是否连接
+        names = sorted(self._monitored)
+        t = self._value_table
+        t.blockSignals(True)
+        t.setRowCount(len(names))
+        for row, path in enumerate(names):
+            # 复选框列 (col 0)
+            cb_item = t.item(row, 0)
+            if cb_item is None:
+                cb_item = QTableWidgetItem()
+                cb_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                cb_item.setCheckState(Qt.Checked if path in self._visible_vars else Qt.Unchecked)
+                t.setItem(row, 0, cb_item)
+            # 名称列 (col 1)
+            name_item = t.item(row, 1)
+            if name_item is None:
+                name_item = QTableWidgetItem(path)
+                name_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                t.setItem(row, 1, name_item)
+            # 数值列 (col 2) — 探针未连接时显示 "—"
+            val_item = t.item(row, 2)
+            if val_item is None:
+                val_item = QTableWidgetItem("—")
+                val_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                val_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+                t.setItem(row, 2, val_item)
+            # 类型列 (col 3)
+            type_item = t.item(row, 3)
+            if type_item is None:
+                info = self._registry.get(path)
+                type_str = format_type(info[1]) if info else ""
+                type_item = QTableWidgetItem(type_str)
+                type_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                t.setItem(row, 3, type_item)
+        t.blockSignals(False)
+
+        # 探针未连接或未勾选变量 → 到此为止
+        if not self._backend.is_connected or not names:
             return
 
         # Build monitor list from current selections
@@ -1844,6 +2245,24 @@ def run_scope(elf_path: str = None, pack_path: str = None, target: str = None):
         QPushButton#disconnectBtn:hover {
             background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
                 stop:0 #d03040, stop:1 #b82830);
+        }
+        QPushButton#resetBtn {
+            padding: 6px 14px;
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 #8a6a20, stop:1 #5a4a10);
+            border: 1px solid #c8a830;
+            border-radius: 5px;
+            color: #ffe0b0;
+            font-weight: bold;
+        }
+        QPushButton#resetBtn:hover {
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 #c8a830, stop:1 #8a6a20);
+        }
+        QPushButton#resetBtn:disabled {
+            background: #1e1e34;
+            color: #606080;
+            border: 1px solid #2a2a4a;
         }
         QPushButton#scanBtn {
             padding: 5px 14px;
