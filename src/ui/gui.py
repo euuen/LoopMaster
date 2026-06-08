@@ -1863,15 +1863,43 @@ class MainWindow(QMainWindow):
         if not monitor_list:
             return
 
-        try:
-            raw = self._backend.read_batch(monitor_list)
-        except Exception:
-            return
+        # 分开普通变量和解引用成员
+        regular_list = []
+        deref_list = []
+        for path, addr, ti in monitor_list:
+            if path in self._deref_paths:
+                deref_list.append((path, addr, ti))
+            else:
+                regular_list.append((path, addr, ti))
+
+        # 读取普通变量
+        data = {}
+        if regular_list:
+            try:
+                raw = self._backend.read_batch(regular_list)
+                for name, val in raw.items():
+                    data[name] = ([0.0], [val])
+            except Exception:
+                pass
+
+        # 读取解引用成员（两阶段：先读指针值，再读目标成员）
+        if deref_list:
+            try:
+                for path, addr, ti in deref_list:
+                    ptr_addr, member_offset, _ = self._deref_paths[path]
+                    ptr_val = self._backend.read(ptr_addr, 4)
+                    if ptr_val < PTR_NULL_THRESHOLD:
+                        data[path] = ([0.0], [float('nan')])
+                        continue
+                    target_addr = ptr_val + member_offset
+                    from src.core.mem_backend import _TypeDecoder
+                    decoder = _TypeDecoder(self._backend)
+                    val = decoder.decode(target_addr, ti)
+                    data[path] = ([0.0], [val])
+            except Exception:
+                pass
 
         # Convert to plot-compatible format for _update_value_table
-        data = {}
-        for name, val in raw.items():
-            data[name] = ([0.0], [val])
         self._update_value_table(data)
 
     # ================================================================
